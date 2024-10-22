@@ -52,7 +52,7 @@ This time, it will ask for the SSH passphrase and not the user password. You sho
 
 ### 2.4. (Optional, but highly recommended) Disable password authentication on guest machine.
 
-At first, I didn't quite understand what difference this step makes. Essentially, if you leave the password authentication enabled, and an unauthorized party gets access to your remote name and server-ip, they could, in theory, bruteforce the password to get access to the server. However, if you disable password authentication, the one and only way to remotely connect to the server will be through a keypair, making it a lot more secure.
+At first, I didn't quite understand what difference this step makes. Essentially, if you leave the password authentication enabled, and an unauthorized party gets access to your remote name and server-ip, they could, in theory, bruteforce the password to get access to the server. However, if you disable password authentication, the one and only way to remotely connect to the server will be through an SSH keypair, making it a lot more secure.
 
 Edit the `/etc/ssh/sshd_config` file. By default, the line `#PasswordAuthentication yes` is commented out, denoted by the \# symbol, so we have to change that to `PasswordAuthentication no`. Save changes to the file. Restart the SSH service with the following command: 
 ```
@@ -186,4 +186,152 @@ And with that done, you should be able to access the Wordpress deployment from t
 
 #### (DON'T SET IT UP YET!)
 
-## 5. Nginx / ok im tired of typing for now let's do a half-commit so that I don't lose this and get back to it in a bit
+## 5. Nginx
+
+### 5.1. Install Nginx
+```
+sudo apt install nginx
+```
+
+### 5.2. SSL Certificates (mostly adopted from [this](https://www.digitalocean.com/community/tutorials/how-to-create-a-self-signed-ssl-certificate-for-nginx-in-ubuntu#step-1-creating-the-tls-certificate) tutorial)
+
+```
+sudo openssl req -x509 -noenc -days 365 -newkey rsa:2048 -keyout /etc/ssl/private/nginx-selfsigned.key -out /etc/ssl/certs/nginx-selfsigned.crt
+```
+In interactive mode, type in information about yourself and your organization. You can leave the fields blank by typing `.` instead. This will generate a self-signed key and certificate pair.
+```
+sudo openssl dhparam -out /etc/nginx/dhparam.pem 4096
+```
+This creates a "strong Diffie-Hellman (DH) group", whatever that means, it's needed. For more information check the link provided above.
+
+Create a snippet file at `/etc/nginx/snippets/self-signed.conf` and put in the following 2 lines:
+```
+ssl_certificate /etc/ssl/certs/nginx-selfsigned.crt;
+ssl_certificate_key /etc/ssl/private/nginx-selfsigned.key;
+```
+You also need to create a configuration file for SSL at `/etc/nginx/snippets/ssl-params.conf`, this is adopted from [Cipherlist.eu](https://cipherlist.eu/)
+```
+ssl_protocols TLSv1.3;
+ssl_prefer_server_ciphers on;
+ssl_dhparam /etc/nginx/dhparam.pem; 
+ssl_ciphers EECDH+AESGCM:EDH+AESGCM;
+ssl_ecdh_curve secp384r1;
+ssl_session_timeout  10m;
+ssl_session_cache shared:SSL:10m;
+ssl_session_tickets off;
+ssl_stapling on;
+ssl_stapling_verify on;
+resolver 1.1.1.1 1.0.0.1 valid=300s;
+resolver_timeout 5s;
+# Disable strict transport security for now. You can uncomment the following
+# line if you understand the implications.
+#add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload";
+add_header X-Frame-Options DENY;
+add_header X-Content-Type-Options nosniff;
+add_header X-XSS-Protection "1; mode=block";
+```
+I use CloudFlare DNS instead of the Google one, just a personal preference. If you want to use Google's DNS, replace the line `resolver 1.1.1.1...` with `resolver 8.8.8.8 8.8.4.4 valid=300s;`.
+
+### 5.3. (Optional) Specify a local domain name
+
+I did this step so that instead of typing in the server ip in the web browser, I could instead write a domain, which looks more like a real website. You can skip this step, but it will come in handy in the future step where I specify the Nginx configuration file and use this local domain name as a server name.
+
+In `/etc/hosts` file on your system (For Windows, that would be `C:/Windows/System32/drivers/etc/hosts`), add in a line that looks like this:
+```
+<server-ip> <domain-name>
+```
+To give a more specific example, my local server ip was `192.168.139.132` and the domain name I chose was `testdomain.com`, so the line looked like:
+```
+192.168.139.132 testdomain.com
+```
+Save changes to the file, needs administrator privileges (which means you might need to run Notepad as admin), and now you can access the Apache2 server at `http://testdomain.com:8080/` instead of the `<server-ip>:8080/`.
+
+### 5.4. Nginx configuration
+
+Create a configuration file at `/etc/nginx/sites-available/wordpress`:
+```
+server {
+        listen 443 ssl;
+        listen [::]:443 ssl;
+        include snippets/self-signed.conf;
+        include snippets/ssl-params.conf;
+
+        root /var/www/html;
+
+        index index.nginx-debian.html;
+
+        server_name testdomain.com;
+
+        location / {
+                try_files $uri $uri/ =404;
+        }
+
+        location /wordpress/ {
+                proxy_pass http://127.0.0.1:8080;
+                proxy_set_header Host $host;
+                proxy_set_header X-Real-IP $remote_addr;
+                proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                proxy_set_header X-Forwarded-Host $server_name;
+                proxy_set_header X-Forwarded-Proto $scheme;
+                proxy_redirect off;
+        }
+}
+
+server {
+        listen 80;
+        listen [::]:80;
+
+        server_name testdomain.com;
+
+        return 301 https://$server_name$request_uri;
+}
+```
+This is quite a hefty configuration file, let's go through it:
+- listens on port 443 (default HTTPS port)
+- includes both snippet files, so the keypair and the SSL configuration
+- the root folder for the Nginx server is `/var/www/html`
+- the default page it displays is the `index.nginx-debian.html` file (auto-generated when installing Nginx)
+- the server name is the one we specified in previous step, if you skipped it, type in the server IP instead
+- at location `/`, we load the aforementioned index file which tells us that the Nginx server is working
+- at location `/wordpress/` (note the trailing backslash, important for redirects), Nginx acts as a reverse proxy (for more information, check this piece of [documentation](https://developer.wordpress.org/advanced-administration/security/https/#using-a-reverse-proxy))
+- the second server listens at port 80 (default HTTP port) and redirects all traffic to HTTPS instead
+
+With all of this out of the way, the only thing left to do is to add a symbolic link to the `sites-enabled` folder and restart the Nginx service.
+```
+sudo ln -s /etc/nginx/sites-available/wordpress /etc/nginx/sites-enabled/
+sudo systemctl restart nginx
+```
+
+### 5.5. Additional changes
+
+Before we are able to access Wordpress through Nginx, some adjustments need to be done to the configuration files.
+
+In `/srv/www/wordpress/wp-config.php`, the following lines need to be added for HTTPS traffic to work through the reverse proxy (same source as the previous part)
+```
+define( 'FORCE_SSL_ADMIN', true );
+// in some setups HTTP_X_FORWARDED_PROTO might contain 
+// a comma-separated list e.g. http,https
+// so check for https existence
+if( strpos( $_SERVER['HTTP_X_FORWARDED_PROTO'], 'https') !== false )
+    $_SERVER['HTTPS'] = 'on';
+```
+In the Apache2 virtual host configuration file at `/etc/apache2/sites-available/wordpress.conf`, the DocumentRoot needs to be changed now:
+```
+...
+DocumentRoot /srv/www/
+...
+```
+Restart the Apache2 service:
+```
+sudo systemctl restart apache2
+```
+And finally, we should be able to access Wordpress via the `https://testdomain.com/wordpress/` in our web browser on the host machine. We can proceed with the Wordpress installation now.
+
+## 6. Firewall
+
+With the Apache2 configuration changed, if we try to access the port 8080 directly, we will not be able to reach Wordpress, since it now only works through Nginx reverse proxy. So, the best course of action would be to close port 8080. Or rather, to only have the ports 22 (SSH), 80 (HTTP) and 443 (HTTPS) be open to public. That is done with only 2 commands:
+```
+sudo ufw allow 22,80,443/tcp
+sudo ufw --force enable
+```
+Congratulations! You now have a working Wordpress installation on Ubuntu Server, running on Apache2 behind an Nginx reverse proxy. Pat yourself on the back for making it that far.
